@@ -1,0 +1,284 @@
+//we will be using glsl version 4.5 syntax
+#version 450  
+#extension GL_EXT_nonuniform_qualifier : enable
+#define RAYTRACING 1
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 1, rgba32f) uniform image2D color;
+
+layout(set = 3, binding = 0) readonly buffer ComputeBuffer{   
+    int numOfTris; 
+	int numOfLights;
+    int resolutionX;
+    int resolutionY;
+	float invTrans[16];
+} ComputeData;
+
+layout(set = 1, binding = 0, std430) readonly buffer Pos
+{
+	float value[1000000*6][3];
+} pos;
+
+layout(set = 4, binding = 0, std430) readonly buffer Normal
+{
+	vec3 value[1000000*6];
+} normal;
+
+layout(set = 5, binding = 0, std430) readonly buffer Color
+{
+	float value[1000000*6][4];
+} colors;
+
+layout(set = 6, binding = 0, std430) readonly buffer Lights
+{
+	float value[1000000*6][3];
+} lights;
+
+layout(set = 7, binding = 0, std430) readonly buffer AabbMin
+{
+	float value[1000000*12][3];
+} aabbMin;
+
+layout(set = 9, binding = 0, std430) readonly buffer AabbMax
+{
+	float value[1000000*12][3];
+} aabbMax;
+layout(set = 10, binding = 0, std430) readonly buffer FirstPrim
+{
+	int value[1000000*12];
+} firstPrim;
+
+layout(set = 11, binding = 0, std430) readonly buffer PrimCount
+{
+	float value[1000000*12];
+} primCount;
+
+layout(set = 12, binding = 0, std430) readonly buffer LeftChild
+{
+	int value[1000000*12];
+} leftChild;
+
+layout(set = 8, binding = 0, std430) readonly buffer BVHIndexies
+{
+	int idx[1000000*6];
+} bvhIdx;
+
+layout(set = 2, binding = 0, std430) readonly buffer Triangles
+{
+	int value[1000000*6];
+} indexBuffer;
+vec3 Samples[] = {
+	vec3(0.71836, 0.58312, 0.45953),
+	vec3(0.03261, 0.06322, 0.03469),
+	vec3(0.08794, 0.29483, 0.84835),
+	vec3(0.23969, 0.89031, 0.12689),
+	vec3(0.83119, 0.98175, 0.25644),
+	vec3(0.96979, 0.40928, 0.85368),
+	vec3(0.11534, 0.49878, 0.91035),
+	vec3(0.80195, 0.33731, 0.09063),
+	vec3(0.89956, 0.07236, 0.00188),
+	vec3(0.55980, 0.74458, 0.86712),
+	vec3(0.28911, 0.31682, 0.54491),	
+	vec3(0.28911, 0.31682, 0.54491),
+	vec3(0.15103, 0.19963, 0.38840),
+	vec3(0.63165, 0.42634, 0.58312),
+	vec3(0.02251, 0.65808, 0.61300),
+	vec3(0.83447, 0.87702, 0.62748),
+	vec3(0.66552, 0.64247, 0.48214),
+	vec3(0.23650, 0.36632, 0.93686),
+	vec3(0.47608, 0.15811, 0.73940),
+	vec3(0.17923, 0.00644, 0.07359),
+	vec3(0.48047, 0.32160, 0.81694)
+};
+vec3 randomHemisphere(int i, vec3 normal) {
+    vec3 sphereSample = normalize(Samples[i]);
+    if (dot(sphereSample, normal) > 0.0)
+        return sphereSample;
+    else
+        return -sphereSample;
+}
+ivec2 xy_int ;
+bool raySphereIntersect(vec3 orig, vec3 dir, vec3 sphere, float radius){
+	vec3 secPoint = orig + dir;
+	float u = dot((sphere - orig), dir) / dot(-dir, -dir);
+	vec3 point = orig + u * (dir);
+	return distance(point, sphere) < radius;
+}
+
+bool rayTriangleIntersect(vec3 orig, vec3 dir, vec3 v0, vec3 v1, vec3 v2)
+{
+	vec3 v0v1 = v1 - v0;
+	vec3 v0v2 = v2 - v0;
+
+	vec3 pvec = cross(dir, v0v2);
+
+	float det = dot(v0v1,pvec);
+
+	if (det < 0.000001)
+		return false;
+
+	float invDet = 1.0 / det;
+
+	vec3 tvec = orig - v0;
+
+	float u = dot(tvec,pvec) * invDet;
+
+	if (u < 0 || u > 1)
+		return false;
+
+	vec3 qvec = cross(tvec,v0v1);
+
+	float v = dot(dir,qvec) * invDet;
+
+	if (v < 0 || u + v > 1)
+		return false;
+
+	float t = dot(v0v2,qvec) * invDet;
+
+	return true;
+}
+struct Ray
+{
+	 vec3 O;
+	 vec3 D;
+	 float t;
+}ray;
+
+bool IntersectAABB( vec3 bmin, vec3 bmax )
+{
+	float tx1 = (bmin.x - ray.O.x) / ray.D.x, tx2 = (bmax.x - ray.O.x) / ray.D.x;
+	float tmin = min( tx1, tx2 ), tmax = max( tx1, tx2 );
+	float ty1 = (bmin.y - ray.O.y) / ray.D.y, ty2 = (bmax.y - ray.O.y) / ray.D.y;
+	tmin = max( tmin, min( ty1, ty2 ) ), tmax = min( tmax, max( ty1, ty2 ) );
+	float tz1 = (bmin.z - ray.O.z) / ray.D.z, tz2 = (bmax.z - ray.O.z) / ray.D.z;
+	tmin = max( tmin, min( tz1, tz2 ) ), tmax = min( tmax, max( tz1, tz2 ) );
+	return tmax >= tmin && tmin < ray.t && tmax > 0;
+}
+int TriIndex = -1;
+bool IntersectTri( vec3 vertex0, vec3 vertex1, vec3 vertex2)
+{
+    const vec3 edge1 = vertex1 - vertex0;
+    const vec3 edge2 = vertex2 - vertex0;
+    const vec3 h = cross( ray.D, edge2 );
+    const float a = dot( edge1, h );
+    if (a > -0.0001f && a < 0.0001f) return false; // ray parallel to triangle
+    const float f = 1 / a;
+    const vec3 s = ray.O - vertex0;
+    const float u = f * dot( s, h );
+    if (u < 0 || u > 1) return false;
+    const vec3 q = cross( s, edge1 );
+    const float v = f * dot( ray.D, q );
+    if (v < 0 || u + v > 1) return false;
+    const float t = f * dot( edge2, q );
+    if (t > 0.0001f) ray.t = min( ray.t, t );
+	return true;
+}
+
+int IntersectBVH( int nodeIdx )
+{
+int i = 0;
+	int stack[10000000];
+	int stackCount = 1;	
+	stack[0] = nodeIdx;
+	while(stackCount >= 0){
+		int index = stack[--stackCount];
+		
+		if (index < 0) break; 
+		vec3 aa = vec3(aabbMin.value[index][0],aabbMin.value[index][1],aabbMin.value[index][2]);
+		vec3 bb = vec3(aabbMax.value[index][0],aabbMax.value[index][1],aabbMax.value[index][2]);
+		if (!IntersectAABB( aa, bb)) continue;
+		if (primCount.value[index] > 0)
+		{	
+			for (int j = 0; j < primCount.value[index]; j++ ){
+				int ind = (firstPrim.value[index] + j)*3;
+				vec3 pos1 = vec3( 	pos.value[(indexBuffer.value[ind])][0], pos.value[(indexBuffer.value[ind])][1], pos.value[(indexBuffer.value[ind])][2]);
+				vec3 pos2 = vec3( 	pos.value[(indexBuffer.value[ind+1])][0], pos.value[(indexBuffer.value[ind+1])][1], pos.value[(indexBuffer.value[ind+1])][2]);
+				vec3 pos3 = vec3( 	pos.value[(indexBuffer.value[ind+2])][0], pos.value[(indexBuffer.value[ind+2])][1], pos.value[(indexBuffer.value[ind+2])][2]);
+					
+				if(IntersectTri( pos1, pos2, pos3 ))
+					return ind;
+			}
+		}
+		else
+		{	
+			stack[stackCount++] = leftChild.value[index];
+			stack[stackCount++] = leftChild.value[index] + 1;
+		}
+	}
+	return -1;
+}
+vec3 cameraPos;
+void CalcColor(in int ind, inout vec3 outputColor){
+		if(ind >=0){
+			vec3 lightColor = vec3(1,1,1);
+			vec3 color1 = vec3( 	colors.value[(indexBuffer.value[ind])][0], colors.value[(indexBuffer.value[ind])][1], colors.value[(indexBuffer.value[ind])][2]);
+			
+			for(int j = 0; j < ComputeData.numOfLights; j++){
+				vec3 P = vec3( 	pos.value[(indexBuffer.value[ind])][0], pos.value[(indexBuffer.value[ind])][1], pos.value[(indexBuffer.value[ind])][2]);
+				vec3 N = normalize(vec3( 	normal.value[(indexBuffer.value[ind])][0], normal.value[(indexBuffer.value[ind])][1], normal.value[(indexBuffer.value[ind])][2]));
+				vec3 Light =  vec3( lights.value[(indexBuffer.value[ind])][0], lights.value[(indexBuffer.value[ind])][1], lights.value[(indexBuffer.value[ind])][2]);
+				vec3 L = normalize(Light - P);
+				float diffuseLight = max(dot(N, L), 0);
+				vec3 diffuse = color1 * lightColor * diffuseLight;
+				vec3 V = normalize(cameraPos - P);
+				vec3 H = normalize(L + V);
+				float specularLight = pow(max(dot(N, H), 0), 1);
+				vec3 specular = color1 * lightColor * specularLight;
+				outputColor += (specular + diffuse);
+			}
+		}
+}
+void CalcBounces(in int ind, inout vec3 outputColor){
+	vec3 sampleColor = vec3(0);
+	vec3 P = vec3( 	pos.value[(indexBuffer.value[ind])][0], pos.value[(indexBuffer.value[ind])][1], pos.value[(indexBuffer.value[ind])][2]);
+	vec3 N = normalize(vec3( 	normal.value[(indexBuffer.value[ind])][0], normal.value[(indexBuffer.value[ind])][1], normal.value[(indexBuffer.value[ind])][2]));
+	ray.O = P;
+	for(int i =0; i < 20; i++){
+		ray.D = randomHemisphere(i, N);
+		ray.t = 1e30f;
+		int ind = IntersectBVH(0);
+		
+		if(ind >=0){
+			CalcColor(ind, sampleColor);
+			outputColor += sampleColor/20;
+		}
+	}
+}
+
+void main()
+{
+    //grab global ID
+    xy_int = ivec2(gl_GlobalInvocationID.xy);
+    //make sure we don't access past the buffer size
+    if(xy_int.x < ComputeData.resolutionX && xy_int.y < ComputeData.resolutionY)
+    {
+		mat4 InvTrans = mat4( 	vec4( ComputeData.invTrans[0], ComputeData.invTrans[4], ComputeData.invTrans[8], ComputeData.invTrans[12]),
+								vec4( ComputeData.invTrans[1], ComputeData.invTrans[5], ComputeData.invTrans[9], ComputeData.invTrans[13]),
+								vec4( ComputeData.invTrans[2], ComputeData.invTrans[6], ComputeData.invTrans[10], ComputeData.invTrans[14]),
+								vec4( ComputeData.invTrans[3], ComputeData.invTrans[7], ComputeData.invTrans[11], ComputeData.invTrans[15]));
+
+		vec3 rayOrg = vec3((xy_int/ vec2(ComputeData.resolutionX, ComputeData.resolutionY)) - vec2(0.5),0);
+		vec3 rayDir = vec3(0,0,1);
+		rayOrg = vec4( InvTrans * vec4(rayOrg,1)).xyz;
+		rayDir = vec4( InvTrans * vec4(rayDir,0)).xyz;
+		cameraPos = vec4( InvTrans * vec4(0,0,0,1)).xyz;
+		ray.D = rayDir;
+		ray.O = rayOrg;
+		ray.t = 1e30f;
+		bool found = false;
+		vec4 c;
+		int ind = IntersectBVH(0);
+		vec3 outputColor = vec3(0);
+#ifdef RAYTRACING		
+		CalcColor(ind, outputColor);
+		CalcBounces(ind, outputColor);
+		imageStore(color, xy_int, vec4(outputColor,1));	
+#else		//raycasting
+		if(ind >=0){
+			CalcColor(ind, outputColor);
+			imageStore(color, xy_int, vec4(outputColor,1));	
+		}
+#endif
+    }
+}
